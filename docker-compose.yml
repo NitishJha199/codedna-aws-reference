@@ -27,7 +27,8 @@ services:
 
   order-api:
     build:
-      context: ./src/order-api
+      context: .
+      dockerfile: src/order-api/Dockerfile
     environment:
       DATABASE_URL: postgresql://app:app@postgres:5432/referenceapp
       INVENTORY_SERVICE_URL: http://inventory-service:8001
