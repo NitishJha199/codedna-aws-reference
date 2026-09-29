@@ -1,0 +1,76 @@
+name: CodeDNA Reference CI
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-sbom:
+    name: Test and SBOM - ${{ matrix.service }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - order-api
+          - inventory-service
+
+    defaults:
+      run:
+        working-directory: src/${{ matrix.service }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install service dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Install CycloneDX generator
+        run: pip install cyclonedx-bom==7.1.0
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          cyclonedx-py requirements \
+            requirements.txt \
+            --output-format JSON \
+            --output-file sbom.json
+
+      - name: Validate CycloneDX document
+        run: |
+          python - <<'PY'
+          import json
+
+          with open("sbom.json", encoding="utf-8") as handle:
+              payload = json.load(handle)
+
+          assert payload.get("bomFormat") == "CycloneDX"
+          assert payload.get("components"), "SBOM has no components"
+
+          print("bomFormat:", payload["bomFormat"])
+          print("components:", len(payload["components"]))
+          PY
+
+      - name: Upload CodeDNA SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codedna-sbom-${{ matrix.service }}
+          path: src/${{ matrix.service }}/sbom.json
+          if-no-files-found: error
+          retention-days: 7
