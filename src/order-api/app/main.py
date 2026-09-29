@@ -8,10 +8,24 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://app:app@postgres:5432/referenceapp",
-)
+def get_database_url():
+    database_url = os.getenv("DATABASE_URL")
+    if database_url:
+        return database_url
+
+    db_host = os.getenv("DB_HOST")
+    if db_host:
+        return (
+            f"postgresql://{os.getenv('DB_USER', 'codedna')}:"
+            f"{os.environ['DB_PASSWORD']}@"
+            f"{db_host}:{os.getenv('DB_PORT', '5432')}/"
+            f"{os.getenv('DB_NAME', 'referenceapp')}"
+        )
+
+    return "postgresql://app:app@postgres:5432/referenceapp"
+
+
+DATABASE_URL = get_database_url()
 
 INVENTORY_SERVICE_URL = os.getenv(
     "INVENTORY_SERVICE_URL",
