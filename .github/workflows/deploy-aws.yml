@@ -1,0 +1,296 @@
+name: Deploy AWS Reference
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+  deployments: write
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: codedna-ref-cluster
+  ORDER_SERVICE: order-api
+  INVENTORY_SERVICE: inventory-service
+  ORDER_FAMILY: codedna-ref-order-api
+  INVENTORY_FAMILY: codedna-ref-inventory-service
+  ORDER_REPOSITORY: codedna-ref/order-api
+  INVENTORY_REPOSITORY: codedna-ref/inventory-service
+  ALB_DNS: codedna-ref-alb-274654863.us-east-1.elb.amazonaws.com
+
+jobs:
+  deploy:
+    name: Build and deploy to ECS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::759553606952:role/codedna-ref-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push immutable images
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          docker build \
+            -f src/order-api/Dockerfile \
+            -t "$ECR_REGISTRY/$ORDER_REPOSITORY:$IMAGE_TAG" \
+            .
+
+          docker build \
+            -t "$ECR_REGISTRY/$INVENTORY_REPOSITORY:$IMAGE_TAG" \
+            src/inventory-service
+
+          docker push "$ECR_REGISTRY/$ORDER_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$INVENTORY_REPOSITORY:$IMAGE_TAG"
+
+      - name: Register SHA-specific task definitions
+        id: tasks
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          register_revision() {
+            FAMILY="$1"
+            CONTAINER="$2"
+            IMAGE="$3"
+            OUTPUT_FILE="$4"
+
+            aws ecs describe-task-definition \
+              --task-definition "$FAMILY" \
+              --query taskDefinition \
+              --output json > current-task.json
+
+            jq \
+              --arg container "$CONTAINER" \
+              --arg image "$IMAGE" \
+              '
+              del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy
+              )
+              |
+              .containerDefinitions |= map(
+                if .name == $container
+                then .image = $image
+                else .
+                end
+              )
+              ' current-task.json > register-task.json
+
+            aws ecs register-task-definition \
+              --cli-input-json file://register-task.json \
+              --query taskDefinition.taskDefinitionArn \
+              --output text > "$OUTPUT_FILE"
+          }
+
+          register_revision \
+            "$ORDER_FAMILY" \
+            "$ORDER_SERVICE" \
+            "$ECR_REGISTRY/$ORDER_REPOSITORY:$IMAGE_TAG" \
+            order-task-arn.txt
+
+          register_revision \
+            "$INVENTORY_FAMILY" \
+            "$INVENTORY_SERVICE" \
+            "$ECR_REGISTRY/$INVENTORY_REPOSITORY:$IMAGE_TAG" \
+            inventory-task-arn.txt
+
+          echo "order_task_arn=$(cat order-task-arn.txt)" >> "$GITHUB_OUTPUT"
+          echo "inventory_task_arn=$(cat inventory-task-arn.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve ECS network configuration
+        id: network
+        run: |
+          set -euo pipefail
+
+          NETWORK_JSON="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ORDER_SERVICE" \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration' \
+            --output json)"
+
+          SUBNETS="$(echo "$NETWORK_JSON" | jq -r '.subnets | join(",")')"
+          SECURITY_GROUPS="$(echo "$NETWORK_JSON" | jq -r '.securityGroups | join(",")')"
+
+          echo "subnets=$SUBNETS" >> "$GITHUB_OUTPUT"
+          echo "security_groups=$SECURITY_GROUPS" >> "$GITHUB_OUTPUT"
+
+      - name: Run database initialization task
+        id: migration
+        env:
+          ORDER_TASK_ARN: ${{ steps.tasks.outputs.order_task_arn }}
+          SUBNETS: ${{ steps.network.outputs.subnets }}
+          SECURITY_GROUPS: ${{ steps.network.outputs.security_groups }}
+        run: |
+          set -euo pipefail
+
+          TASK_ARN="$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --launch-type FARGATE \
+            --task-definition "$ORDER_TASK_ARN" \
+            --network-configuration \
+              "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=ENABLED}" \
+            --overrides \
+              "{\"containerOverrides\":[{\"name\":\"$ORDER_SERVICE\",\"command\":[\"python\",\"-m\",\"app.init_db\"]}]}" \
+            --query 'tasks[0].taskArn' \
+            --output text)"
+
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "Migration task was not started"
+            exit 1
+          fi
+
+          echo "Migration task: $TASK_ARN"
+
+          aws ecs wait tasks-stopped \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN"
+
+          EXIT_CODE="$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[?name==`order-api`].exitCode | [0]' \
+            --output text)"
+
+          STOP_REASON="$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].stoppedReason' \
+            --output text)"
+
+          echo "Migration exit code: $EXIT_CODE"
+          echo "Migration stop reason: $STOP_REASON"
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "Database initialization failed"
+            exit 1
+          fi
+
+      - name: Deploy ECS services
+        env:
+          ORDER_TASK_ARN: ${{ steps.tasks.outputs.order_task_arn }}
+          INVENTORY_TASK_ARN: ${{ steps.tasks.outputs.inventory_task_arn }}
+        run: |
+          set -euo pipefail
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$INVENTORY_SERVICE" \
+            --task-definition "$INVENTORY_TASK_ARN" \
+            --desired-count 1 \
+            --no-cli-pager >/dev/null
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ORDER_SERVICE" \
+            --task-definition "$ORDER_TASK_ARN" \
+            --desired-count 1 \
+            --no-cli-pager >/dev/null
+
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$INVENTORY_SERVICE" "$ORDER_SERVICE"
+
+      - name: Validate deployed application
+        run: |
+          set -euo pipefail
+
+          echo "ALB: $ALB_DNS"
+
+          echo "Checking order-api..."
+          curl --fail --show-error --silent \
+            --retry 12 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            "http://$ALB_DNS/health"
+
+          echo
+
+          echo "Checking inventory-service..."
+          curl --fail --show-error --silent \
+            --retry 12 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            "http://$ALB_DNS/products"
+
+          echo
+
+      - name: Record order-api GitHub deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          DEPLOYMENT_ID="$(jq -n \
+            --arg ref "$GITHUB_SHA" \
+            --arg environment "order-api:production-aws" \
+            '{
+              ref: $ref,
+              environment: $environment,
+              auto_merge: false,
+              required_contexts: []
+            }' \
+            | gh api \
+                --method POST \
+                "repos/${GITHUB_REPOSITORY}/deployments" \
+                --input - \
+                --jq '.id')"
+
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments/$DEPLOYMENT_ID/statuses" \
+            -f state=success \
+            -f environment="order-api:production-aws" \
+            >/dev/null
+
+      - name: Record inventory-service GitHub deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          DEPLOYMENT_ID="$(jq -n \
+            --arg ref "$GITHUB_SHA" \
+            --arg environment "inventory-service:production-aws" \
+            '{
+              ref: $ref,
+              environment: $environment,
+              auto_merge: false,
+              required_contexts: []
+            }' \
+            | gh api \
+                --method POST \
+                "repos/${GITHUB_REPOSITORY}/deployments" \
+                --input - \
+                --jq '.id')"
+
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments/$DEPLOYMENT_ID/statuses" \
+            -f state=success \
+            -f environment="inventory-service:production-aws" \
+            >/dev/null
